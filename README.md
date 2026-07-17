@@ -1,5 +1,8 @@
 # Vnlp-scale
 
+[![CI](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml/badge.svg)](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml/badge.svg)](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml)
+
 Vnlp-scale is an open-source storage and inference substrate for language models that do not fit in conventional RAM or VRAM. It converts safetensors checkpoints into a checksummed, chunk-addressable store and executes Llama-compatible matrix operations by decoding one row block at a time.
 
 The project goal is to make **trillion-parameter-class model storage and experimentation addressable on home hardware**. That goal is deliberately separated into three claims:
