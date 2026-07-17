@@ -3,7 +3,7 @@
 ## Development setup
 
 ```bash
-git clone https://github.com/vnlscale/Vnlp-scale.git
+git clone https://github.com/vnlpscale/Vnlp-scale.git
 cd Vnlp-scale
 python -m venv .venv
 source .venv/bin/activate

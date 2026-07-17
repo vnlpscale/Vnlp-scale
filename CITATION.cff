@@ -5,7 +5,7 @@ type: software
 version: 0.1.0
 date-released: 2026-07-18
 license: MIT
-repository-code: "https://github.com/vnlscale/Vnlp-scale"
-url: "https://github.com/vnlscale/Vnlp-scale"
+repository-code: "https://github.com/vnlpscale/Vnlp-scale"
+url: "https://github.com/vnlpscale/Vnlp-scale"
 authors:
   - name: "Vnlp-scale contributors"

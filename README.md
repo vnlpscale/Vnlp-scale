@@ -61,16 +61,38 @@ vnlp-scale plan \
 
 ## Installation
 
+Vnlp-scale requires Python 3.10 or newer. Install the current release candidate directly from GitHub:
+
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install "vnlp-scale @ git+https://github.com/vnlpscale/Vnlp-scale.git"
+vnlp-scale --version
 ```
 
 PyTorch and tokenizer support are optional:
 
 ```bash
-pip install -e '.[torch,tokenizer]'
+python -m pip install "vnlp-scale[torch,tokenizer] @ git+https://github.com/vnlpscale/Vnlp-scale.git"
+```
+
+For development and the included examples:
+
+```bash
+git clone https://github.com/vnlpscale/Vnlp-scale.git
+cd Vnlp-scale
+python -m pip install -e '.[dev]'
+pytest
+```
+
+### Five-minute smoke test
+
+```bash
+python examples/create_synthetic.py /tmp/vnlp-source
+vnlp-scale record --source /tmp/vnlp-source --output /tmp/vnlp-store --quality med --chunk-mib 1
+vnlp-scale verify --store /tmp/vnlp-store
+vnlp-scale run --store /tmp/vnlp-store --prompt-ids 1,2,3 --max-new 2 --backend numpy
 ```
 
 ## Record a model
