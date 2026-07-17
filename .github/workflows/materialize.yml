@@ -3,6 +3,8 @@ name: Materialize release candidate
 on:
   push:
     branches: ["release/v0.1.0"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: write
@@ -14,6 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 0
       - name: Reconstruct validated source
         shell: bash
