@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnlp-scale"
+version = "0.1.0"
+description = "Bounded-memory model storage and chunk-streaming inference for very large safetensors LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "Vnlp-scale contributors"}]
+keywords = ["llm", "inference", "compression", "safetensors", "streaming", "quantization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.26",
+  "safetensors>=0.4.3",
+  "huggingface-hub>=0.23",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.3"]
+tokenizer = ["transformers>=4.44", "sentencepiece>=0.2"]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+vnlp-scale = "vnlp_scale.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vnlscale/Vnlp-scale"
+Repository = "https://github.com/vnlscale/Vnlp-scale"
+Issues = "https://github.com/vnlscale/Vnlp-scale/issues"
+Changelog = "https://github.com/vnlscale/Vnlp-scale/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.coverage.run]
+source = ["vnlp_scale"]
+omit = ["src/vnlp_scale/engine_torch.py"]
