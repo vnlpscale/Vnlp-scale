@@ -1,0 +1,27 @@
+name: Benchmark result
+description: Submit a reproducible performance or quality result
+title: "[benchmark] "
+labels: [benchmark]
+body:
+  - type: input
+    attributes:
+      label: Model and immutable revision
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Hardware and software
+      description: CPU, GPU, RAM, storage, links, filesystem, OS, driver, Python, and package versions.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Commands
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Raw results
+      description: Include cold and warm runs, prompt/generation lengths, batch, cache settings, peak memory, and quality metric.
+    validations:
+      required: true
