@@ -45,10 +45,10 @@ dev = [
 vnlp-scale = "vnlp_scale.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/vnlscale/Vnlp-scale"
-Repository = "https://github.com/vnlscale/Vnlp-scale"
-Issues = "https://github.com/vnlscale/Vnlp-scale/issues"
-Changelog = "https://github.com/vnlscale/Vnlp-scale/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/vnlpscale/Vnlp-scale"
+Repository = "https://github.com/vnlpscale/Vnlp-scale"
+Issues = "https://github.com/vnlpscale/Vnlp-scale/issues"
+Changelog = "https://github.com/vnlpscale/Vnlp-scale/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
