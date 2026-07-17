@@ -1,13 +1,15 @@
 name: Materialize release candidate
 
 on:
-  push:
-    branches: ["release/v0.1.0"]
   pull_request:
     branches: ["main"]
 
 permissions:
   contents: write
+
+concurrency:
+  group: materialize-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: true
 
 jobs:
   materialize:
@@ -16,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
       - name: Reconstruct validated source
         shell: bash
