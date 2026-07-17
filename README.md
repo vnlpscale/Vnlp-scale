@@ -1,7 +1,13 @@
-# Vnlp-scale
+<p align="center">
+  <img src="https://avatars.githubusercontent.com/u/306128335?s=240&v=4" alt="Vnlp-scale logo" width="160">
+</p>
 
-[![CI](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml/badge.svg)](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml/badge.svg)](https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml)
+<h1 align="center">Vnlp-scale</h1>
+
+<p align="center">
+  <a href="https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml"><img src="https://github.com/vnlpscale/Vnlp-scale/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml"><img src="https://github.com/vnlpscale/Vnlp-scale/actions/workflows/codeql.yml/badge.svg" alt="CodeQL"></a>
+</p>
 
 Vnlp-scale is an open-source storage and inference substrate for language models that do not fit in conventional RAM or VRAM. It converts safetensors checkpoints into a checksummed, chunk-addressable store and executes Llama-compatible matrix operations by decoding one row block at a time.
 
