@@ -1,10 +1,7 @@
 """Vnlp-scale: bounded-memory storage and inference primitives for very large LLMs."""
 
-import ml_dtypes
-import numpy as np
-
-# Register BF16 with NumPy before safetensors opens tensors through its NumPy backend.
-_BFLOAT16_DTYPE = np.dtype(ml_dtypes.bfloat16)
+# Import for its NumPy BF16 dtype-registration side effect.
+import ml_dtypes  # noqa: F401
 
 from .codec import PRESETS, CodecConfig, decode_tensor, encode_tensor, preset
 from .estimate import HardwareProfile, ModelProfile, plan_inference
