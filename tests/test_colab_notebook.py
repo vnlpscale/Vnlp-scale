@@ -33,6 +33,10 @@ def test_colab_chat_notebook_is_valid():
     assert "normalize_token_ids" in combined
     assert "fused_linear" in combined
     assert "triton_quant" in combined
+    assert 'globals().get("DEFAULT_MAX_NEW_TOKENS", 64)' in combined
+    assert 'globals().get("DEFAULT_TEMPERATURE", 0.7)' in combined
+    assert "allow_tags=False" in combined
+    assert "missing_runtime_names" in combined
 
     for index, source in enumerate(code_cells):
         compile(source, f"{notebook_path.name}:cell-{index}", "exec")
