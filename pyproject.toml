@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.26",
+  "ml-dtypes>=0.4",
   "safetensors>=0.4.3",
   "huggingface-hub>=0.23",
 ]
@@ -73,10 +74,7 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-exclude = [
-  "src/vnlp_scale/engine_torch.py",
-  "notebooks/Vnlp_scale_Chat_Demo.ipynb",
-]
+exclude = ["src/vnlp_scale/engine_torch.py"]
 
 [tool.coverage.run]
 source = ["vnlp_scale"]
