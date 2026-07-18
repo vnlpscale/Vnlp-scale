@@ -37,7 +37,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev,torch]'
-      - run: pytest tests/test_engine.py -q
+      - run: pytest tests/test_engine.py tests/test_fused_linear.py -q
 
   build-and-installed-e2e:
     runs-on: ubuntu-latest
