@@ -8,6 +8,7 @@ claimed until hardware-specific benchmarks are published.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
@@ -30,9 +31,11 @@ def _import_torch():
     return torch
 
 
-def _resolve_dtype(torch, dtype):
-    if dtype is None:
-        return torch.float16
+def _resolve_dtype(torch, dtype, device):
+    if dtype is None or (isinstance(dtype, str) and dtype.lower() == "auto"):
+        if device.type == "cuda":
+            return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.float32
     if not isinstance(dtype, str):
         return dtype
     mapping = {
@@ -44,9 +47,16 @@ def _resolve_dtype(torch, dtype):
         "fp32": torch.float32,
     }
     try:
-        return mapping[dtype.lower()]
+        resolved = mapping[dtype.lower()]
     except KeyError as exc:
         raise ValueError(f"unsupported torch dtype: {dtype}") from exc
+    if resolved is torch.bfloat16 and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("bfloat16 was requested but is not supported by this CUDA device")
+    return resolved
+
+
+def _flash_attn_available() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
 
 
 class TorchStoreProvider:
@@ -69,7 +79,7 @@ class TorchStoreProvider:
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested but torch.cuda.is_available() is false")
-        self.dtype = _resolve_dtype(torch, dtype)
+        self.dtype = _resolve_dtype(torch, dtype, self.device)
         self.cache_budget = cache_bytes
         self.max_stages = max_stages
         self.pin_memory = bool(pin_memory and self.device.type == "cuda")
@@ -188,7 +198,16 @@ class TorchStoreProvider:
 
 
 class TorchLlamaEngine:
-    def __init__(self, provider: TorchStoreProvider, config: dict):
+    def __init__(
+        self,
+        provider: TorchStoreProvider,
+        config: dict,
+        *,
+        attention_backend: str = "auto",
+        compile_resident: bool = True,
+        compile_mode: str = "reduce-overhead",
+        cuda_graph_decode: bool = True,
+    ):
         torch = provider.torch
         self.torch = torch
         self.provider = provider
@@ -220,6 +239,62 @@ class TorchLlamaEngine:
                 / self.head_dim
             )
         )
+        self.attention_backend = self._select_attention_backend(attention_backend)
+        self._flash_attn_func = None
+        if self.attention_backend == "flash_attention_2":
+            from flash_attn import flash_attn_func
+
+            self._flash_attn_func = flash_attn_func
+
+        self._rms_norm_impl = self._rms_norm_eager
+        self.compile_enabled = False
+        if compile_resident and hasattr(torch, "compile"):
+            try:
+                self._rms_norm_impl = torch.compile(
+                    self._rms_norm_eager, mode=compile_mode, fullgraph=False
+                )
+                self.compile_enabled = True
+            except Exception:
+                self._rms_norm_impl = self._rms_norm_eager
+
+        self.cuda_graph_enabled = bool(
+            cuda_graph_decode and provider.device.type == "cuda" and torch.cuda.is_available()
+        )
+        self._argmax_graph = None
+        self._argmax_static_logits = None
+        self._argmax_static_output = None
+
+    def _select_attention_backend(self, backend: str) -> str:
+        normalized = backend.lower()
+        if normalized not in {"auto", "flash_attention_2", "sdpa", "eager"}:
+            raise ValueError(f"unsupported attention backend: {backend}")
+        flash_usable = (
+            self.provider.device.type == "cuda"
+            and self.provider.dtype in {self.torch.float16, self.torch.bfloat16}
+            and _flash_attn_available()
+        )
+        if normalized == "flash_attention_2":
+            if not flash_usable:
+                raise RuntimeError(
+                    "FlashAttention-2 requires CUDA, fp16/bf16, and the flash-attn package"
+                )
+            return normalized
+        if normalized == "auto":
+            if flash_usable:
+                return "flash_attention_2"
+            if hasattr(self.torch.nn.functional, "scaled_dot_product_attention"):
+                return "sdpa"
+            return "eager"
+        return normalized
+
+    def optimization_report(self) -> dict:
+        return {
+            "device": str(self.provider.device),
+            "dtype": str(self.provider.dtype).removeprefix("torch."),
+            "attention": self.attention_backend,
+            "torch_compile": self.compile_enabled,
+            "cuda_graph_decode": self.cuda_graph_enabled,
+        }
 
     def _validate_config(self) -> None:
         model_type = self.config.get("model_type")
@@ -248,6 +323,10 @@ class TorchLlamaEngine:
         cache_bytes: int = 0,
         max_stages: int | None = None,
         verify: bool = False,
+        attention_backend: str = "auto",
+        compile_resident: bool = True,
+        compile_mode: str = "reduce-overhead",
+        cuda_graph_decode: bool = True,
     ) -> TorchLlamaEngine:
         directory = Path(store_directory)
         try:
@@ -266,12 +345,22 @@ class TorchLlamaEngine:
             cache_bytes=cache_bytes,
             max_stages=max_stages,
         )
-        return cls(provider, config)
+        return cls(
+            provider,
+            config,
+            attention_backend=attention_backend,
+            compile_resident=compile_resident,
+            compile_mode=compile_mode,
+            cuda_graph_decode=cuda_graph_decode,
+        )
 
-    def _rms_norm(self, values, weight):
+    def _rms_norm_eager(self, values, weight):
         variance = values.float().pow(2).mean(dim=-1, keepdim=True)
         normalized = values * self.torch.rsqrt(variance + self.rms_epsilon).to(values.dtype)
         return normalized * weight
+
+    def _rms_norm(self, values, weight):
+        return self._rms_norm_impl(values, weight)
 
     def _rope(self, values, positions):
         torch = self.torch
@@ -305,16 +394,39 @@ class TorchLlamaEngine:
         value_cache = (
             current_value if value_cache is None else torch.cat([value_cache, current_value], dim=0)
         )
-        repetitions = self.attention_heads // self.kv_heads
-        expanded_key = key_cache.repeat_interleave(repetitions, dim=1)
-        expanded_value = value_cache.repeat_interleave(repetitions, dim=1)
-        scores = torch.einsum("thd,shd->ths", query.float(), expanded_key.float())
-        scores /= math.sqrt(self.head_dim)
-        key_positions = torch.arange(key_cache.shape[0], device=self.provider.device)
-        causal = key_positions.unsqueeze(0) <= positions.unsqueeze(1)
-        scores = scores.masked_fill(~causal.unsqueeze(1), -1e30)
-        probabilities = torch.softmax(scores, dim=-1).to(values.dtype)
-        context = torch.einsum("ths,shd->thd", probabilities, expanded_value)
+
+        if self.attention_backend == "flash_attention_2":
+            context = self._flash_attn_func(
+                query.unsqueeze(0),
+                key_cache.unsqueeze(0),
+                value_cache.unsqueeze(0),
+                causal=True,
+            ).squeeze(0)
+        else:
+            repetitions = self.attention_heads // self.kv_heads
+            expanded_key = key_cache.repeat_interleave(repetitions, dim=1)
+            expanded_value = value_cache.repeat_interleave(repetitions, dim=1)
+            if self.attention_backend == "sdpa":
+                q = query.transpose(0, 1).unsqueeze(0)
+                k = expanded_key.transpose(0, 1).unsqueeze(0)
+                v = expanded_value.transpose(0, 1).unsqueeze(0)
+                mask = torch.arange(key_cache.shape[0], device=self.provider.device).unsqueeze(0)
+                mask = mask <= positions.unsqueeze(1)
+                context = torch.nn.functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=mask.unsqueeze(0).unsqueeze(0),
+                    dropout_p=0.0,
+                ).squeeze(0).transpose(0, 1)
+            else:
+                scores = torch.einsum("thd,shd->ths", query.float(), expanded_key.float())
+                scores /= math.sqrt(self.head_dim)
+                key_positions = torch.arange(key_cache.shape[0], device=self.provider.device)
+                causal = key_positions.unsqueeze(0) <= positions.unsqueeze(1)
+                scores = scores.masked_fill(~causal.unsqueeze(1), -1e30)
+                probabilities = torch.softmax(scores, dim=-1).to(values.dtype)
+                context = torch.einsum("ths,shd->thd", probabilities, expanded_value)
         context = context.reshape(token_count, self.hidden_size)
         return self.provider.linear(names["o"], context), key_cache, value_cache
 
@@ -342,6 +454,20 @@ class TorchLlamaEngine:
             hidden = hidden + self._mlp(self._rms_norm(hidden, second_norm), names)
         hidden = self._rms_norm(hidden, self.final_norm)
         return self.provider.linear(self.lm_head_name, hidden[-1:])[0]
+
+    def _greedy_argmax(self, logits):
+        if not self.cuda_graph_enabled:
+            return self.torch.argmax(logits)
+        if self._argmax_graph is None:
+            self._argmax_static_logits = self.torch.empty_like(logits)
+            self._argmax_static_logits.copy_(logits)
+            self._argmax_graph = self.torch.cuda.CUDAGraph()
+            with self.torch.cuda.graph(self._argmax_graph):
+                self._argmax_static_output = self.torch.argmax(self._argmax_static_logits)
+        else:
+            self._argmax_static_logits.copy_(logits)
+        self._argmax_graph.replay()
+        return self._argmax_static_output
 
     def generate(
         self,
@@ -380,7 +506,7 @@ class TorchLlamaEngine:
                     torch.cuda.synchronize(self.provider.device)
                 timings.append(time.perf_counter() - started)
                 if greedy:
-                    next_token = int(torch.argmax(logits).item())
+                    next_token = int(self._greedy_argmax(logits).item())
                 else:
                     probabilities = torch.softmax(logits.float() / temperature, dim=-1)
                     next_token = int(
@@ -400,6 +526,7 @@ class TorchLlamaEngine:
             "tokens_per_second": len(timings) / sum(timings) if timings else 0.0,
             "kv_bytes": kv_bytes,
             "provider_stats": dict(self.provider.stats),
+            "optimizations": self.optimization_report(),
         }
 
     def close(self) -> None:
