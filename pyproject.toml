@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch>=2.3"]
+flash = ["torch>=2.3", "flash-attn>=2.6"]
 tokenizer = ["transformers>=4.44", "sentencepiece>=0.2"]
 dev = [
   "build>=1.2",
