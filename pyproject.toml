@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch>=2.3"]
+flash = ["flash-attn>=2.5"]
 tokenizer = ["transformers>=4.44", "sentencepiece>=0.2"]
 dev = [
   "build>=1.2",
@@ -71,6 +72,7 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+exclude = ["src/vnlp_scale/engine_torch.py"]
 
 [tool.coverage.run]
 source = ["vnlp_scale"]
