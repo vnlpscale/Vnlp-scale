@@ -1,9 +1,9 @@
 """Experimental chunk-streaming PyTorch runtime for Llama-compatible stores.
 
 Unlike integrations that materialize an entire transformer layer, this runtime decodes
-and transfers one row chunk for each matrix multiplication. It therefore preserves the
-same bounded-memory property as the NumPy reference backend. CUDA performance is not
-claimed until hardware-specific benchmarks are published.
+and transfers one row chunk for each matrix multiplication. Stage-aware linear execution
+can also multiply directly from low-rank and packed-quantized codec stages without first
+constructing the complete decoded weight matrix.
 """
 
 from __future__ import annotations
@@ -18,9 +18,12 @@ from pathlib import Path
 
 import numpy as np
 
+from . import codec
 from .engine_np import layer_parameter_names
 from .errors import StoreError, UnsupportedModelError
 from .store import StoreReader
+
+_TRITON_QUANT_KERNEL = None
 
 
 def _import_torch():
@@ -59,6 +62,101 @@ def _flash_attn_available() -> bool:
     return importlib.util.find_spec("flash_attn") is not None
 
 
+def _triton_available() -> bool:
+    return importlib.util.find_spec("triton") is not None
+
+
+def _cached_value_bytes(value) -> int:
+    if isinstance(value, (tuple, list)):
+        return sum(_cached_value_bytes(item) for item in value)
+    return int(value.numel()) * int(value.element_size())
+
+
+def _triton_packed_quant_linear(torch, inputs, packed, scales, *, rows, cols, bits, group_size):
+    """Multiply by one packed quant stage without materializing dequantized weights."""
+
+    global _TRITON_QUANT_KERNEL
+
+    import triton
+    import triton.language as tl
+
+    if _TRITON_QUANT_KERNEL is None:
+
+        @triton.jit
+        def packed_quant_matvec_kernel(
+            input_pointer,
+            packed_pointer,
+            scale_pointer,
+            output_pointer,
+            rows: tl.constexpr,
+            cols: tl.constexpr,
+            bits: tl.constexpr,
+            group_size: tl.constexpr,
+            block_rows: tl.constexpr,
+            block_cols: tl.constexpr,
+        ):
+            row_offsets = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
+            batch_index = tl.program_id(1)
+            accumulator = tl.zeros((block_rows,), dtype=tl.float32)
+            values_per_byte = 8 // bits
+            code_mask = (1 << bits) - 1
+            qmax = (1 << (bits - 1)) - 1
+
+            for column_start in range(0, cols, block_cols):
+                column_offsets = column_start + tl.arange(0, block_cols)
+                input_values = tl.load(
+                    input_pointer + batch_index * cols + column_offsets,
+                    mask=column_offsets < cols,
+                    other=0.0,
+                )
+                flat_offsets = row_offsets[:, None] * cols + column_offsets[None, :]
+                byte_offsets = flat_offsets // values_per_byte
+                slots = flat_offsets % values_per_byte
+                shifts = (values_per_byte - 1 - slots) * bits
+                packed_values = tl.load(
+                    packed_pointer + byte_offsets,
+                    mask=(row_offsets[:, None] < rows) & (column_offsets[None, :] < cols),
+                    other=0,
+                ).to(tl.int32)
+                codes = (packed_values >> shifts) & code_mask
+                signed = codes - qmax
+                scale_offsets = flat_offsets // group_size
+                stage_scales = tl.load(
+                    scale_pointer + scale_offsets,
+                    mask=(row_offsets[:, None] < rows) & (column_offsets[None, :] < cols),
+                    other=0.0,
+                )
+                accumulator += tl.sum(
+                    signed.to(tl.float32) * stage_scales * input_values[None, :], axis=1
+                )
+
+            tl.store(
+                output_pointer + batch_index * rows + row_offsets,
+                accumulator,
+                mask=row_offsets < rows,
+            )
+
+        _TRITON_QUANT_KERNEL = packed_quant_matvec_kernel
+
+    flat = inputs.reshape(-1, cols).contiguous()
+    output = torch.empty((flat.shape[0], rows), device=flat.device, dtype=flat.dtype)
+    grid = (triton.cdiv(rows, 32), flat.shape[0])
+    _TRITON_QUANT_KERNEL[grid](
+        flat,
+        packed,
+        scales,
+        output,
+        rows=rows,
+        cols=cols,
+        bits=bits,
+        group_size=group_size,
+        block_rows=32,
+        block_cols=256,
+        num_warps=4,
+    )
+    return output
+
+
 class TorchStoreProvider:
     def __init__(
         self,
@@ -70,10 +168,15 @@ class TorchStoreProvider:
         max_stages: int | None = None,
         pin_memory: bool = True,
         max_materialize_bytes: int = 64 * 1024 * 1024,
+        fused_linear: bool = True,
+        quant_block_rows: int = 256,
+        triton_quant: bool = True,
     ):
         torch = _import_torch()
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be non-negative")
+        if quant_block_rows <= 0:
+            raise ValueError("quant_block_rows must be positive")
         self.torch = torch
         self.store = store
         self.device = torch.device(device)
@@ -84,10 +187,16 @@ class TorchStoreProvider:
         self.max_stages = max_stages
         self.pin_memory = bool(pin_memory and self.device.type == "cuda")
         self.max_materialize_bytes = max_materialize_bytes
-        self._cache: OrderedDict[tuple[str, int, int | None], object] = OrderedDict()
+        self.fused_linear = bool(fused_linear)
+        self.quant_block_rows = int(quant_block_rows)
+        self.triton_quant_enabled = bool(
+            triton_quant and self.device.type == "cuda" and _triton_available()
+        )
+        self._cache: OrderedDict[tuple, object] = OrderedDict()
         self._cache_bytes = 0
         self.stats = {
             "chunks_decoded": 0,
+            "chunks_stage_streamed": 0,
             "tensors_decoded": 0,
             "decode_seconds": 0.0,
             "transfer_seconds": 0.0,
@@ -95,18 +204,64 @@ class TorchStoreProvider:
             "cache_hits": 0,
             "cache_bytes": 0,
             "peak_live_bytes": 0,
+            "fused_linear_calls": 0,
+            "raw_matmul_stages": 0,
+            "svd_matmul_stages": 0,
+            "quant_matmul_stages": 0,
+            "triton_quant_stages": 0,
+            "triton_quant_fallbacks": 0,
+            "materialized_weight_bytes_avoided": 0,
         }
 
     def _sync(self) -> None:
         if self.device.type == "cuda":
             self.torch.cuda.synchronize(self.device)
 
-    def _decode_chunk(self, name: str, index: int):
-        key = (name, index, self.max_stages)
+    def _cache_get(self, key):
         cached = self._cache.get(key)
+        if cached is None:
+            return None
+        self._cache.move_to_end(key)
+        self.stats["cache_hits"] += 1
+        return cached
+
+    def _cache_put(self, key, value):
+        value_bytes = _cached_value_bytes(value)
+        self.stats["peak_live_bytes"] = max(
+            self.stats["peak_live_bytes"], self._cache_bytes + value_bytes
+        )
+        if value_bytes > self.cache_budget:
+            return value
+        previous = self._cache.pop(key, None)
+        if previous is not None:
+            self._cache_bytes -= _cached_value_bytes(previous)
+        self._cache[key] = value
+        self._cache_bytes += value_bytes
+        while self._cache_bytes > self.cache_budget and self._cache:
+            _, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= _cached_value_bytes(evicted)
+        self.stats["cache_bytes"] = self._cache_bytes
+        return value
+
+    def _transfer_array(self, array: np.ndarray, *, dtype=None):
+        cpu = self.torch.from_numpy(np.array(array, copy=True, order="C"))
+        if self.pin_memory:
+            cpu = cpu.pin_memory()
+        self._sync()
+        transfer_started = time.perf_counter()
+        tensor = cpu.to(
+            self.device,
+            dtype=dtype if dtype is not None else self.dtype,
+            non_blocking=self.pin_memory,
+        )
+        self._sync()
+        self.stats["transfer_seconds"] += time.perf_counter() - transfer_started
+        return tensor
+
+    def _decode_chunk(self, name: str, index: int):
+        key = ("decoded", name, index, self.max_stages)
+        cached = self._cache_get(key)
         if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats["cache_hits"] += 1
             return cached
 
         started = time.perf_counter()
@@ -114,27 +269,192 @@ class TorchStoreProvider:
         self.stats["decode_seconds"] += time.perf_counter() - started
         self.stats["chunks_decoded"] += 1
         self.stats["decoded_bytes_total"] += array.nbytes
+        tensor = self._transfer_array(array)
+        return self._cache_put(key, tensor)
 
-        cpu = self.torch.from_numpy(array)
-        if self.pin_memory:
-            cpu = cpu.pin_memory()
-        self._sync()
-        transfer_started = time.perf_counter()
-        tensor = cpu.to(self.device, dtype=self.dtype, non_blocking=self.pin_memory)
-        self._sync()
-        self.stats["transfer_seconds"] += time.perf_counter() - transfer_started
-        tensor_bytes = tensor.numel() * tensor.element_size()
-        self.stats["peak_live_bytes"] = max(
-            self.stats["peak_live_bytes"], self._cache_bytes + tensor_bytes
+    def _chunk_stages(self, name: str, index: int):
+        tensor = self.store.info(name)
+        try:
+            chunk = tensor["chunks"][index]
+        except IndexError as exc:
+            raise StoreError(f"chunk index out of range for {name!r}: {index}") from exc
+        stages = chunk["stages"]
+        if self.max_stages is not None:
+            if self.max_stages < 0:
+                raise ValueError("max_stages must be non-negative")
+            stages = stages[: self.max_stages]
+        return chunk, stages
+
+    def _load_raw_stage(self, name, chunk_index, stage_index, stage, shape):
+        key = ("raw", name, chunk_index, stage_index)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        views = self.store._views_for_stage(stage)
+        if len(views) != 1:
+            raise StoreError("raw stage requires one blob")
+        if stage["meta"].get("dtype") != "float16":
+            raise StoreError("unsupported raw stage dtype")
+        values = np.frombuffer(views[0], dtype=np.float16)
+        if values.size != int(np.prod(shape)):
+            raise StoreError("raw stage size does not match chunk shape")
+        return self._cache_put(key, self._transfer_array(values.reshape(shape)))
+
+    def _load_svd_stage(self, name, chunk_index, stage_index, stage, shape):
+        key = ("svd", name, chunk_index, stage_index)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        views = self.store._views_for_stage(stage)
+        if len(views) != 2:
+            raise StoreError("SVD stage requires two blobs")
+        rows = int(stage["meta"]["rows"])
+        cols = int(stage["meta"]["cols"])
+        rank = int(stage["meta"]["rank"])
+        if (rows, cols) != tuple(shape):
+            raise StoreError("SVD metadata does not match chunk shape")
+        left = np.frombuffer(views[0], dtype=np.float16)
+        right = np.frombuffer(views[1], dtype=np.float16)
+        if left.size != rows * rank or right.size != rank * cols:
+            raise StoreError("SVD blob length does not match metadata")
+        tensors = (
+            self._transfer_array(left.reshape(rows, rank)),
+            self._transfer_array(right.reshape(rank, cols)),
         )
-        if tensor_bytes <= self.cache_budget:
-            self._cache[key] = tensor
-            self._cache_bytes += tensor_bytes
-            while self._cache_bytes > self.cache_budget and self._cache:
-                _, evicted = self._cache.popitem(last=False)
-                self._cache_bytes -= evicted.numel() * evicted.element_size()
-            self.stats["cache_bytes"] = self._cache_bytes
-        return tensor
+        return self._cache_put(key, tensors)
+
+    def _load_quant_stage(self, name, chunk_index, stage_index, stage, shape, *, packed):
+        mode = "quant-packed" if packed else "quant-unpacked"
+        key = (mode, name, chunk_index, stage_index)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        views = self.store._views_for_stage(stage)
+        if len(views) != 2:
+            raise StoreError("quant stage requires code and scale blobs")
+        bits = int(stage["meta"]["bits"])
+        group = int(stage["meta"]["group_size"])
+        count = int(stage["meta"]["value_count"])
+        group_count = int(stage["meta"]["group_count"])
+        if count != int(np.prod(shape)) or group <= 0 or group_count <= 0:
+            raise StoreError("quant metadata does not match chunk shape")
+        scales = np.frombuffer(views[1], dtype=np.float16)
+        if scales.size != group_count:
+            raise StoreError("quant scale blob has the wrong length")
+        scale_tensor = self._transfer_array(scales, dtype=self.dtype)
+        if packed:
+            code_tensor = self._transfer_array(
+                np.frombuffer(views[0], dtype=np.uint8), dtype=self.torch.uint8
+            )
+        else:
+            qmax = (1 << (bits - 1)) - 1
+            started = time.perf_counter()
+            codes = codec._unpack_bits(views[0], bits, group_count * group)
+            signed = (codes.astype(np.int16) - qmax).astype(np.int8)
+            self.stats["decode_seconds"] += time.perf_counter() - started
+            code_tensor = self._transfer_array(signed, dtype=self.torch.int8)
+        return self._cache_put(key, (code_tensor, scale_tensor))
+
+    def _quant_stage_linear_blocked(self, flat, name, chunk_index, stage_index, stage, shape):
+        torch = self.torch
+        rows, cols = shape
+        signed, scales = self._load_quant_stage(
+            name, chunk_index, stage_index, stage, shape, packed=False
+        )
+        group = int(stage["meta"]["group_size"])
+        count = rows * cols
+        signed_flat = signed.reshape(-1)[:count]
+        output = torch.empty((flat.shape[0], rows), device=self.device, dtype=self.dtype)
+        aligned = cols % group == 0
+        if aligned:
+            groups_per_row = cols // group
+            signed_rows = signed_flat.reshape(rows, cols)
+            scale_rows = scales.reshape(rows, groups_per_row)
+        for row_start in range(0, rows, self.quant_block_rows):
+            row_stop = min(rows, row_start + self.quant_block_rows)
+            if aligned:
+                block = signed_rows[row_start:row_stop].to(self.dtype)
+                block *= scale_rows[row_start:row_stop].repeat_interleave(group, dim=1)
+            else:
+                flat_start = row_start * cols
+                flat_stop = row_stop * cols
+                offsets = torch.arange(flat_start, flat_stop, device=self.device)
+                block = signed_flat[flat_start:flat_stop].to(self.dtype)
+                block *= scales[offsets // group]
+                block = block.reshape(row_stop - row_start, cols)
+            output[:, row_start:row_stop] = flat @ block.transpose(0, 1)
+        live_bytes = min(self.quant_block_rows, rows) * cols * torch.empty(
+            (), dtype=self.dtype
+        ).element_size()
+        self.stats["materialized_weight_bytes_avoided"] += max(
+            rows * cols * torch.empty((), dtype=self.dtype).element_size() - live_bytes, 0
+        )
+        return output
+
+    def _quant_stage_linear(self, flat, name, chunk_index, stage_index, stage, shape):
+        if self.triton_quant_enabled:
+            packed, scales = self._load_quant_stage(
+                name, chunk_index, stage_index, stage, shape, packed=True
+            )
+            try:
+                output = _triton_packed_quant_linear(
+                    self.torch,
+                    flat,
+                    packed,
+                    scales,
+                    rows=shape[0],
+                    cols=shape[1],
+                    bits=int(stage["meta"]["bits"]),
+                    group_size=int(stage["meta"]["group_size"]),
+                )
+                self.stats["triton_quant_stages"] += 1
+                self.stats["materialized_weight_bytes_avoided"] += (
+                    shape[0]
+                    * shape[1]
+                    * self.torch.empty((), dtype=self.dtype).element_size()
+                )
+                return output
+            except Exception:
+                self.triton_quant_enabled = False
+                self.stats["triton_quant_fallbacks"] += 1
+        return self._quant_stage_linear_blocked(
+            flat, name, chunk_index, stage_index, stage, shape
+        )
+
+    def _linear_chunk_stages(self, name: str, chunk_index: int, flat):
+        torch = self.torch
+        chunk, stages = self._chunk_stages(name, chunk_index)
+        shape = tuple(int(value) for value in chunk["shape"])
+        if len(shape) != 2:
+            raise StoreError("stage-aware linear requires matrix chunks")
+        output = torch.zeros((flat.shape[0], shape[0]), device=self.device, dtype=self.dtype)
+        for stage_index, stage in enumerate(stages):
+            kind = stage.get("kind")
+            if kind == "raw":
+                weight = self._load_raw_stage(
+                    name, chunk_index, stage_index, stage, shape
+                )
+                output.addmm_(flat, weight.transpose(0, 1))
+                self.stats["raw_matmul_stages"] += 1
+            elif kind == "svd":
+                left, right = self._load_svd_stage(
+                    name, chunk_index, stage_index, stage, shape
+                )
+                output += (flat @ right.transpose(0, 1)) @ left.transpose(0, 1)
+                factor_elements = left.numel() + right.numel()
+                self.stats["materialized_weight_bytes_avoided"] += max(
+                    (shape[0] * shape[1] - factor_elements) * left.element_size(), 0
+                )
+                self.stats["svd_matmul_stages"] += 1
+            elif kind == "quant":
+                output += self._quant_stage_linear(
+                    flat, name, chunk_index, stage_index, stage, shape
+                )
+                self.stats["quant_matmul_stages"] += 1
+            else:
+                raise StoreError(f"unsupported codec stage kind for fused linear: {kind!r}")
+        self.stats["chunks_stage_streamed"] += 1
+        return output
 
     def get(self, name: str):
         torch = self.torch
@@ -183,8 +503,13 @@ class TorchStoreProvider:
         output = torch.empty((flat.shape[0], shape[0]), device=self.device, dtype=self.dtype)
         for chunk_index, chunk in enumerate(tensor["chunks"]):
             start, stop = int(chunk["start"]), int(chunk["stop"])
-            weight = self._decode_chunk(name, chunk_index)
-            output[:, start:stop] = flat @ weight.transpose(0, 1)
+            if self.fused_linear:
+                output[:, start:stop] = self._linear_chunk_stages(name, chunk_index, flat)
+            else:
+                weight = self._decode_chunk(name, chunk_index)
+                output[:, start:stop] = flat @ weight.transpose(0, 1)
+        if self.fused_linear:
+            self.stats["fused_linear_calls"] += 1
         self.stats["tensors_decoded"] += 1
         return output.reshape((*tuple(inputs.shape[:-1]), shape[0]))
 
@@ -294,6 +619,8 @@ class TorchLlamaEngine:
             "attention": self.attention_backend,
             "torch_compile": self.compile_enabled,
             "cuda_graph_decode": self.cuda_graph_enabled,
+            "stage_aware_linear": self.provider.fused_linear,
+            "triton_packed_quant": self.provider.triton_quant_enabled,
         }
 
     def _validate_config(self) -> None:
@@ -327,6 +654,9 @@ class TorchLlamaEngine:
         compile_resident: bool = True,
         compile_mode: str = "reduce-overhead",
         cuda_graph_decode: bool = True,
+        fused_linear: bool = True,
+        quant_block_rows: int = 256,
+        triton_quant: bool = True,
     ) -> TorchLlamaEngine:
         directory = Path(store_directory)
         try:
@@ -344,6 +674,9 @@ class TorchLlamaEngine:
             dtype=dtype,
             cache_bytes=cache_bytes,
             max_stages=max_stages,
+            fused_linear=fused_linear,
+            quant_block_rows=quant_block_rows,
+            triton_quant=triton_quant,
         )
         return cls(
             provider,
