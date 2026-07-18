@@ -64,6 +64,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+exclude = ["notebooks/Vnlp_scale_Chat_Demo.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
@@ -72,7 +73,10 @@ ignore = ["E501"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
-exclude = ["src/vnlp_scale/engine_torch.py"]
+exclude = [
+  "src/vnlp_scale/engine_torch.py",
+  "notebooks/Vnlp_scale_Chat_Demo.ipynb",
+]
 
 [tool.coverage.run]
 source = ["vnlp_scale"]
