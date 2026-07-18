@@ -61,7 +61,9 @@ def test_record_accepts_bfloat16_safetensors(tmp_path):
 
     assert result["encoded_tensors"] == 1
     with StoreReader(output, verify_on_open=True) as reader:
-        assert reader.manifest["tensors"]["model.embed_tokens.weight"]["dtype"] == "BF16"
+        tensor = reader.manifest["tensors"]["model.embed_tokens.weight"]
+        assert tensor["source_dtype"] == "BF16"
+        assert tensor["decoded_dtype"] == "float32"
 
 
 def test_local_index_path_traversal_is_rejected(tmp_path):
