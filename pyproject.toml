@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
   "numpy>=1.26",
+  "ml-dtypes>=0.4",
   "safetensors>=0.4.3",
   "huggingface-hub>=0.23",
 ]

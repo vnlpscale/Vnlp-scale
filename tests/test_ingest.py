@@ -1,6 +1,9 @@
 import json
 
+import ml_dtypes
+import numpy as np
 import pytest
+from safetensors.numpy import save_file
 
 from vnlp_scale.errors import StoreError
 from vnlp_scale.ingest import record
@@ -31,6 +34,36 @@ def test_record_is_chunked_verified_and_resumable(tmp_path, tiny_checkpoint):
         assert reader.summary()["tensors"] == len(tensors)
         assert reader.manifest["finalized"] is True
     assert (output / "config.json").is_file()
+
+
+def test_record_accepts_bfloat16_safetensors(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file(
+        {
+            "model.embed_tokens.weight": np.asarray(
+                [[1.0, 2.0], [3.0, 4.0]],
+                dtype=ml_dtypes.bfloat16,
+            )
+        },
+        source / "model.safetensors",
+    )
+    (source / "config.json").write_text("{}", encoding="utf-8")
+
+    output = tmp_path / "encoded"
+    result = record(
+        str(source),
+        str(output),
+        quality="lossless",
+        max_chunk_bytes=8,
+        progress=None,
+    )
+
+    assert result["encoded_tensors"] == 1
+    with StoreReader(output, verify_on_open=True) as reader:
+        tensor = reader.manifest["tensors"]["model.embed_tokens.weight"]
+        assert tensor["source_dtype"] == "BF16"
+        assert tensor["decoded_dtype"] == "float32"
 
 
 def test_local_index_path_traversal_is_rejected(tmp_path):
