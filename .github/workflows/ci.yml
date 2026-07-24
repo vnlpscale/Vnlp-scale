@@ -55,7 +55,7 @@ jobs:
       - run: vnlp-scale record --source /tmp/vnlp-source --output /tmp/vnlp-store --quality med --chunk-mib 1 --json
       - run: vnlp-scale verify --store /tmp/vnlp-store
       - run: vnlp-scale run --store /tmp/vnlp-store --prompt-ids 1,2,3 --max-new 2 --backend numpy --verify --json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: distributions
           path: dist/
